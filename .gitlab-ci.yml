@@ -1,0 +1,93 @@
+variables:
+    IMAGE_TAG: $DOCKER_REGISTRY/sonar-test-$CI_PROJECT_NAME:$CI_JOB_ID
+    GIT_STRATEGY: clone
+stages:
+  - build
+  - scan
+  - convert
+  - build-sonar
+
+build:
+    stage: build
+    script:
+    # Adding private docker registy token that stored in this variable ${DOCKER_AUTH_CONFIG} to the home directory of gitlab-runner.
+    - echo "${DOCKER_AUTH_CONFIG}" > ~/.docker/config.json 
+    # Loging to the private registry based on the token that stored on ~/.docker/config.json.
+    - docker login $DOCKER_REGISTRY
+    # Build the iTop system image based on Dockerfile that stored on web/ directory.
+    - docker build -t $IMAGE_TAG .
+    # Push the image to the docker private registry.
+    - docker push $DOCKER_REGISTRY/sonar-test-$CI_PROJECT_NAME:$CI_JOB_ID
+    # Retagging the image to be the latest image.
+    - docker image tag $DOCKER_REGISTRY/sonar-test-$CI_PROJECT_NAME:$CI_JOB_ID $DOCKER_REGISTRY/sonar-test-$CI_PROJECT_NAME:latest
+    # Push the image as latest images in the docker private registry.
+    - docker push $DOCKER_REGISTRY/sonar-test-$CI_PROJECT_NAME:latest
+    when: manual
+scan:
+   stage: scan
+   image: $DOCKER_REGISTRY/aquasec/trivy-up:latest
+   variables:
+    TRIVY_CACHE_DIR: /root/.cache/trivy
+    GIT_DEPTH: "0"
+   before_script:
+    - echo "${DOCKER_AUTH_CONFIG}" > ~/.docker/config.json
+    - docker login $DOCKER_REGISTRY
+    - docker pull $DOCKER_REGISTRY/$CI_PROJECT_NAME:latest
+    - docker pull $DOCKER_REGISTRY/aquasec/trivy-up:latest
+
+   script:
+    -  docker run --rm  -e TRIVY_CONCURRENCY=1  -v /var/run/docker.sock:/var/run/docker.sock -v PATH-TO-PROJECT:/tmp $DOCKER_REGISTRY/aquasec/trivy-up:latest --format sarif -o /tmp/trivy-report.sarif image $DOCKER_REGISTRY/$CI_PROJECT_NAME:latest || true
+
+   artifacts:
+    paths: 
+    - PATH-TO-PROJECT/trivy-report.sarif
+   when: manual
+
+convert_trivy_sarif:
+  stage: convert
+  image: $DOCKER_REGISTRY/python-json:latest
+  script:
+   # - docker build -f Dockerfile.p -t $DOCKER_REGISTRY/python-json:latest .
+   # - docker push $DOCKER_REGISTRY/python-json
+    - echo "${DOCKER_AUTH_CONFIG}" > ~/.docker/config.json
+    - docker login $DOCKER_REGISTRY
+    - docker pull $DOCKER_REGISTRY/python-json
+    - docker run -dit -v PATH-TO-PROJECT:/app $DOCKER_REGISTRY/python-json bash -c "python3 sarif_to_sonar.py /app/sarif_to_sonar.py /app/trivy-report.sarif /app/trivy-sonar-report.json"
+    
+  
+  artifacts:
+    paths:
+     #- PATH-TO-PROJECT/trivy-report.sarif
+     - /app/trivy-report.sarif
+
+build-sonar:
+   stage: build-sonar
+   variables:
+      SONAR_USER_HOME: "/opt/.sonar"  # Defines the location of the analysis task cache
+      GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+
+   image: 10.253.30.42:5000/dotnet-7-0-sonar
+   before_script:
+    - docker build -f Dockerfile.s -t $DOCKER_REGISTRY/dotnet-7-0-sonar:latest .
+    - docker push $DOCKER_REGISTRY/dotnet-7-0-sonar:latest
+    - echo "${DOCKER_AUTH_CONFIG}" > ~/.docker/config.json
+    - docker login $DOCKER_REGISTRY
+    - docker pull $DOCKER_REGISTRY/dotnet-7-0-sonar:latest
+   script:
+    - find . -name 'trivy-sonar-report.json' -exec cp {} /tmp/trivy-sonar-report.json \;
+    - docker run --rm -v /tmp:/app -w /app -e SONAR_PROJECT_KEY=$SONAR_PROJECT_KEY -e SONAR_HOST_URL=http://10.x.x.x:9000 -e SONAR_TOKEN=$SONAR_TOKEN registry-IP:5000/dotnet-7-0-sonar
+
+   when: manual
+   allow_failure: false
+
+   rules:
+     - if: $CI_PIPELINE_SOURCE == 'sonar-test'
+     #- if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+     #- if: $CI_COMMIT_BRANCH == 'main'
+     - if: $CI_COMMIT_BRANCH == 'sonar-test'
+    
+   artifacts:
+     paths:
+     - trivy-sonar-report.json
+   dependencies:
+     - scan
